@@ -1,0 +1,297 @@
+#include <WiFi.h>
+#include <WebServer.h>  // standard library
+#include <HTTPClient.h>
+#include <time.h>
+#include "java_data.h"
+#include  <math.h>
+
+String GOOGLE_ID = "AKfycbxgbVLdvS0X20o-RVcGVM-LeEPKRkBhajC9VwPdD8UPICrNfRuxjqU7kORfjuLt0yje";
+ 
+// here you post web pages to your homes intranet which will make page debugging easier
+// as you just need to refresh the browser as opposed to reconnection to the web server
+#define USE_INTRANET
+
+// replace this with your homes intranet connect parameters
+#define LOCAL_SSID "rems"
+#define LOCAL_PASS "12345678"
+
+#define PIN_OUTPUT 12 // connected to nothing but an example of a digital write from the web page
+#define PIN_A0 34     // some analog input sensor
+#define GLed 16
+#define RLed 17
+
+const float VoltageReference = 3.3;  // Reference voltage of the Arduino
+const float R0 = 1000;  // Reference resistor value (100 ohms for PT100)
+const float Gain = 12;//11379;
+
+// Callendar-Van Dusen constants for PT100 (standard platinum RTD)
+const float A = 3.9083e-3;
+const float B = -5.775e-7;
+
+// variables to store measure data and sensor states
+int Leds = 0;
+int count = 0;
+int BitsA0 = 0;
+int t_BitsA0[10];
+float Vuit = 0;
+float VoltsA0 = 0;
+float temperatureC = 0;
+long BitsA0x10 = 0;
+bool SomeOutput = false;
+
+// the XML array size needs to be bigger that your maximum expected size. 2048 is way too big for this example
+char XML[2048];
+
+// just some buffer holder for char operations
+char buf[32];
+
+// variable for the IP reported when you connect to your homes intranet (during debug mode)
+IPAddress Actual_IP;
+
+// definitions of your desired intranet created by the ESP32
+IPAddress PageIP(192, 168, 1, 1);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress ip;
+
+// gotta create a server
+WebServer server(80);
+
+void setup() {
+
+  // standard stuff here
+  Serial.begin(115200);
+
+  SomeOutput = false;
+  digitalWrite(PIN_OUTPUT, SomeOutput);
+
+  pinMode(GLed, OUTPUT);     // Initialize digital pin 12 as an output.
+  pinMode(RLed, OUTPUT);     // Initialize digital pin 14 as an output.
+
+  for (int i = 0; i < 10; i++) {
+    t_BitsA0[i] = analogRead(PIN_A0);
+    BitsA0x10 += t_BitsA0[i];
+  }
+
+  // if your web page or XML are large, you may not get a call back from the web page
+  // and the ESP will think something has locked up and reboot the ESP
+  // not sure I like this feature, actually I kinda hate it
+  // disable watch dog timer 0
+  //disableCore0WDT();
+
+  // maybe disable watch dog timer 1 if needed
+  //  disableCore1WDT();
+
+  // just an update to progress
+  Serial.println("starting server");
+
+  // if you have this #define USE_INTRANET,  you will connect to your home intranet, again makes debugging easier
+#ifdef USE_INTRANET
+  WiFi.begin(LOCAL_SSID, LOCAL_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.print("IP address: "); Serial.println(WiFi.localIP());
+  Actual_IP = WiFi.localIP();
+#endif
+
+  printWifiStatus();
+
+  // these calls will handle data coming back from your web page
+  // this one is a page request, upon ESP getting / string the web page will be sent
+  server.on("/", SendWebsite);
+
+  // upon esp getting /XML string, ESP will build and send the XML, this is how we refresh
+  // just parts of the web page
+  server.on("/xml", SendXML);
+
+  // finally begin the server
+  server.begin();
+
+}
+
+void loop() {
+
+  // you main loop that measures, processes, runs code, etc.
+  // note that handling the "on" strings from the web page are NOT in the loop
+  // that processing is in individual functions all managed by the wifi lib
+
+  // analog input can be from temperature sensors, light sensors, digital pin sensors, etc.
+
+  int new_BitsA0 = analogRead(PIN_A0);
+
+  BitsA0x10 -= t_BitsA0[9];
+
+  for (int i = 9; i > 0; i--) {
+    t_BitsA0[i] = t_BitsA0[i - 1];
+  }
+
+  t_BitsA0[0] = new_BitsA0;
+
+  BitsA0x10 += new_BitsA0;
+
+  int BitsA0 = BitsA0x10 / 10;  
+
+  // standard converion to go from 12 bit resolution reads to volts on an ESP
+  VoltsA0 = BitsA0 * (VoltageReference / 4095);
+  float new_VoltsA0 = new_BitsA0 * (VoltageReference / 4095);
+
+  Vuit = VoltsA0 / Gain;
+  float new_Vuit = new_VoltsA0 / Gain;
+
+  // Calculate the resistance of the RTD (Voltage divider formula)
+  float R_T = calculateRTDResistance(Vuit);
+  float new_R_T = calculateRTDResistance(new_Vuit);
+
+  printf("VUIT: %f R_T: %f\n", Vuit, R_T);
+
+  // Calculate the temperature using the Callendar-Van Dusen equation
+  // For temperatures above 0°C, simplified equation:
+  temperatureC = (float)(R_T - R0) / (float)(A * R0);
+  float new_temperatureC = (float)(new_R_T - R0) / (float)(A * R0);
+
+  if((VoltsA0 >= 0.2) && (VoltsA0<= 2.0)){
+    Leds = 0;
+  }
+  else{
+    Leds = 1;
+  }
+
+  printf("NEW = ADC: %d Voltage: %f temp: %f\n", new_BitsA0, new_VoltsA0, new_temperatureC);
+  printf("ADC gem: %d Voltage: %f temp: %f\n", BitsA0, VoltsA0, temperatureC);
+  printf("leds: %d\n", Leds);
+
+  LED();
+  DataLogger();
+  
+  // no matter what you must call this handleClient repeatidly--otherwise the web page
+  // will not get instructions to do something
+  server.handleClient();
+
+}
+
+void LED(){
+  if (Leds == 0){
+    digitalWrite(RLed, LOW);
+    delay(200);
+  }
+  else if (Leds == 1){
+    digitalWrite(RLed, HIGH);
+    delay(200);
+  }
+}
+
+float calculateRTDResistance(float Vuit) {
+    // Calculate the RTD resistance R3 using the formula derived
+    float numerator = (VoltageReference * R0 * R0) + (Vuit * (R0 + R0) * R0);
+    float denominator = (VoltageReference * R0) - (Vuit * (R0 + R0));
+    float R3 = numerator / denominator;
+    return R3;
+}
+
+void DataLogger() {
+  if(WiFi.status() == WL_CONNECTED){
+   https://script.google.com/macros/s/AKfycbwz7uCMNaYeQS7ryD7INwcXfmsaF481CRmQI_j0wqfREi-ljNznrTvgro7A7NRIhSNldA/exec?sts=write&sam=3&srs=Success&Bits=1837&Volts=1.79&temp=23.4
+    String serverPath = "https://script.google.com/macros/s/" + GOOGLE_ID + "/exec";
+    
+    // Create a URL for sending or writing data to Google Sheets.
+    String Send_Data_URL = serverPath + "?sts=write";
+    Send_Data_URL += "&sam=" + String(count);
+    Send_Data_URL += "&srs=succes";
+    Send_Data_URL += "&Bits=" + String(BitsA0);
+    Send_Data_URL += "&Volts=" + String(Vuit);
+    Send_Data_URL += "&temp=" + String(temperatureC);
+    
+    Serial.print("POST data to spreadsheet:");
+    Serial.println(Send_Data_URL);
+
+    HTTPClient http;
+    http.begin(Send_Data_URL.c_str());
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    int httpResponseCode = http.GET();
+
+    Serial.print("HTTP Status Code: ");
+    Serial.println(httpResponseCode);
+
+    String payload;
+    if (httpResponseCode > 0) {
+        payload = http.getString();
+        Serial.println("Payload: "+ payload);    
+    }
+    else {
+      Serial.printf("Error code: %d\n", httpResponseCode);
+    }
+    
+    http.end();
+
+  }
+  
+  count++;
+  digitalWrite(GLed, HIGH);
+  delay(200); // Send data every 60 seconds
+  digitalWrite(GLed, LOW);
+  
+}
+
+void SendWebsite() {
+
+  Serial.println("sending web page");
+  // you may have to play with this value, big pages need more porcessing time, and hence
+  // a longer timeout that 200 ms
+  server.send(200, "text/html", PAGE_MAIN);
+
+}
+
+// code to send the main web page
+// I avoid string data types at all cost hence all the char mainipulation code
+
+void SendXML() {
+
+  // Serial.println("sending xml");
+
+  strcpy(XML, "<?xml version = '1.0'?>\n<Data>\n");
+
+  // send bitsA0
+  sprintf(buf, "<B0>%d</B0>\n", BitsA0);
+  strcat(XML, buf);
+  // send Volts0
+  sprintf(buf, "<V0>%d.%d</V0>\n", (int) (Vuit), abs((int) (Vuit * 10)  - ((int) (Vuit) * 10)));
+  strcat(XML, buf);
+  // send temperatureC
+  sprintf(buf, "<T0>%d.%d</T0>\n", (int) (temperatureC), abs((int) (temperatureC * 10)  - ((int) (temperatureC) * 10)));
+  strcat(XML, buf);
+
+  strcat(XML, "</Data>\n");
+  // wanna see what the XML code looks like?
+  // actually print it to the serial monitor and use some text editor to get the size
+  // then pad and adjust char XML[2048]; above
+  Serial.println(XML);
+
+  // you may have to play with this value, big pages need more porcessing time, and hence
+  // a longer timeout that 200 ms
+  server.send(200, "text/xml", XML);
+
+}
+
+// I think I got this code from the wifi example
+void printWifiStatus() {
+
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your WiFi shield's IP address:
+  ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+  // print where to go in a browser:
+  Serial.print("Open http://");
+  Serial.println(ip);
+}
